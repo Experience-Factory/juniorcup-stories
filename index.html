@@ -48,6 +48,12 @@ input[type=text]:focus{outline:2px solid var(--red);border-color:transparent}
 .row{display:flex;gap:14px;align-items:flex-start}
 .thumb{flex:0 0 92px;display:flex;flex-direction:column;align-items:center;gap:6px;position:relative}
 .thumb canvas{width:92px;height:92px;border-radius:50%;border:4px solid var(--c,var(--red));background:#000}
+/* signup photo on its way: dimmed medallion, spinning arc, "Photo…" */
+.thumb.load canvas{opacity:.35}
+.thumb.load::before,.thumb.load::after{position:absolute;top:0;left:50%;width:92px;height:92px;margin-left:-46px;border-radius:50%}
+.thumb.load::before{content:"";box-sizing:border-box;border:4px solid transparent;border-top-color:#fff;animation:spin .8s linear infinite}
+.thumb.load::after{content:"Photo…";display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff}
+@keyframes spin{to{transform:rotate(360deg)}}
 .fields{flex:1;min-width:0}
 .fields input{margin-bottom:8px}
 .at{position:relative}
@@ -129,7 +135,8 @@ details li{margin-bottom:8px}
     <ol>
       <li>Saisis les résultats dans le Google Sheet comme d'habitude. Le classement publié suit avec quelques minutes de retard : touche <b>Recharger le classement</b>.</li>
       <li>Vérifie le n° de la manche, puis choisis <b>Junior</b> ou <b>Mini</b>.</li>
-      <li>Podium : les noms sont déjà là. Pour chaque pilote, touche <b>Photo</b> et prends sa photo (ou choisis-la dans la galerie). Centre sa tête dans le rond, puis <b>OK</b>. Pas de photo : le casque s'affiche.</li>
+      <li>Podium : les noms sont déjà là. Un pilote inscrit via la page d'inscription arrive avec son Instagram et sa photo. Sinon, touche <b>Photo</b> et prends sa photo (ou choisis-la dans la galerie), centre sa tête dans le rond, puis <b>OK</b>. Pas de photo : le casque s'affiche.</li>
+      <li>Pour changer un nom, commence à le taper : les pilotes du classement et les inscrits apparaissent.</li>
       <li>Touche <b>Enregistrer l'image</b> : choisis <b>Instagram</b> ou <b>Enregistrer l'image</b> (elle va dans ta galerie).</li>
       <li>Dans Instagram, crée une story avec cette image.</li>
       <li>Un @ Instagram saisi ? Reviens ici, touche <b>Copier les @tags</b>, puis dans la story touche <b>Aa</b> et colle.</li>
@@ -177,7 +184,9 @@ const BANNER = 'JUNIOR CUP 2026  ·  #juniorcup';
 
 // ---------- state ----------
 // man = name typed by hand: the ranking never overwrites it (until "Reprendre le top 3")
-const newSlot = () => ({ img: null, zoom: 1, ox: 0, oy: 0, name: '', handle: '', man: false });
+// auto = signup photo shown, want = signup photo loading, failed = could not load it,
+// skip = pilot whose signup photo was removed with "Sans photo"
+const newSlot = () => ({ img: null, zoom: 1, ox: 0, oy: 0, name: '', handle: '', man: false, auto: '', want: '', failed: '', skip: '' });
 const CATS = { junior: 'JUNIOR', mini: 'MINI' };
 const LABEL = { junior: 'Junior', mini: 'Mini' };
 const newPods = () => ({ junior: [newSlot(), newSlot(), newSlot()], mini: [newSlot(), newSlot(), newSlot()] });
@@ -189,8 +198,9 @@ const S = {
 };
 const STORE = 'ef-juniorcup-stories-v1';     // same github.io origin as clubleague-stories: own keys
 const DSTORE = 'ef-juniorcup-ranking-v1';
+const allSlots = () => [...S.pods.junior, ...S.pods.mini];
 function saveText() {
-  const keep = s => ({ name: s.name, handle: s.handle, man: s.man });
+  const keep = s => ({ name: s.name, handle: s.handle, man: s.man, skip: s.skip });
   try {
     localStorage.setItem(STORE, JSON.stringify({
       day: todayKey(), mode: S.mode, cat: S.cat, round: S.round,
@@ -231,6 +241,95 @@ function csvRows(t) {   // small RFC 4180 parser (quoted fields, commas, CRLF)
   if (f || row.length) { row.push(f); rows.push(row); }
   return rows;
 }
+// ---------- pilots (shared signup base of the EF Eupen championships, published "Pilotes" tab: consenting drivers only) ----------
+const PILOTS_CSV = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQHFv7Zuq-8ngWvULGBXtVuyCk3XzOVOGRNxXax1ZtQVtXXqU1Lea3i3q_5hNnjVd0VGlJPQzEHaW8J/pub?gid=91917171&single=true&output=csv';
+const PSTORE = 'ef-juniorcup-pilots-v1';
+let PILOTS = [];
+function parsePilots(t) {
+  const byName = new Map();
+  csvRows(t).slice(1).forEach(([full, ig, ok, photo]) => {
+    full = (full || '').trim();
+    if (!full) return;
+    if (fold(ok) !== 'oui') { byName.delete(fold(full)); return; }   // latest answer wins, consent included
+    // "BRAUNE Louise" -> last = leading all-caps words, first = the rest
+    const w = full.split(/\s+/), k = w.findIndex(x => x !== x.toUpperCase() || !/\p{L}/u.test(x));
+    const last = (k <= 0 ? w : w.slice(0, k)).join(' '), first = k <= 0 ? '' : w.slice(k).join(' ');
+    const prev = byName.get(fold(full));
+    photo = (photo || '').trim();
+    byName.set(fold(full), {   // later rows (newer answers) overwrite earlier ones...
+      label: full, name: (first ? first + ' ' : '') + last, handle: cleanHandle(ig), key: fold(full),
+      // ...except a newer sign-up without photo, which keeps the last photo sent
+      photo: /^[\w-]{20,}$/.test(photo) ? photo : (prev ? prev.photo : ''),
+    });
+  });
+  return [...byName.values()].sort((a, b) => a.label.localeCompare(b.label));
+}
+async function loadPilots() {
+  try { PILOTS = parsePilots(localStorage.getItem(PSTORE) || ''); } catch (e) {}
+  try {
+    const r = await fetch(PILOTS_CSV, { cache: 'no-store' });
+    if (!r.ok) return;
+    const t = await r.text();
+    PILOTS = parsePilots(t);
+    try { localStorage.setItem(PSTORE, t); } catch (e) {}
+    // drivers put on the podium by the ranking get their @ as soon as the list is in
+    allSlots().forEach(s => { if (!s.man && !s.handle) { const p = pilotByName(s.name); if (p) s.handle = p.handle; } });
+    allSlots().forEach(s => { s._sync && s._sync(); ensurePhoto(s); });
+    saveText(); render();
+  } catch (e) {}   // offline: keep the cached list
+}
+function pilotByName(n) {   // "Regis BOVY" or "BOVY Regis", any case or accents
+  const k = fold(n);
+  return k ? PILOTS.find(p => p.key === k || fold(p.name) === k) : null;
+}
+// photo sent through the signup page (Apps Script only serves photos of consenting pilots)
+const PHOTO_API = 'https://script.google.com/macros/s/AKfycbyQiCv3Yo3lYLESkgjFTQrFxi-58CjfnQOoVjKw_GYhTFTBaIJMuDMYMtprSvBzR8ZH/exec';
+const photoCache = new Map();
+let lastCall = 0;
+function wake() {   // the script takes a few seconds to start: wake it up before a photo is needed
+  if (Date.now() - lastCall < 240000) return;
+  lastCall = Date.now();
+  fetch(PHOTO_API).catch(() => {});
+}
+function fetchPhoto(id) {
+  lastCall = Date.now();
+  const ac = new AbortController(), t = setTimeout(() => ac.abort(), 25000);
+  return fetch(PHOTO_API + '?action=photo&id=' + encodeURIComponent(id), { signal: ac.signal })
+    .then(r => r.json()).then(d => (d.ok ? loadImg(d.data) : null))
+    .finally(() => clearTimeout(t));
+}
+async function pilotPhoto(id) {
+  if (!photoCache.has(id)) {   // one automatic retry (network hiccup, script still starting)
+    photoCache.set(id, fetchPhoto(id)
+      .catch(() => new Promise(r => setTimeout(r, 1500)).then(() => fetchPhoto(id)))
+      .catch(() => null));
+  }
+  const im = await photoCache.get(id);
+  if (!im) photoCache.delete(id);   // try again next time
+  return im;
+}
+// the pilot's signup photo goes in the slot as soon as its name is a known pilot: put there by the
+// ranking, picked from the list, typed by hand or restored on reopening. A photo taken by hand is never replaced.
+function ensurePhoto(s, loud) {
+  const p = pilotByName(s.name);
+  if (s.auto && (!p || s.auto !== (s.skip === p.key ? '' : p.photo))) {   // previous pilot's photo
+    s.img = null; s.auto = ''; s._sync && s._sync(); render();
+  }
+  if (!p || (s.img && !s.auto)) return;
+  const id = s.skip === p.key ? '' : p.photo;
+  if (!id || s.auto === id || s.want === id || s.failed === id) return;
+  s.want = id; s.failed = ''; s._sync && s._sync();
+  pilotPhoto(id).then(im => {
+    if (s.want !== id) return;   // other pilot, or own photo chosen meanwhile
+    s.want = '';
+    if (im) { s.auto = id; setImg(s, im); if (loud) toast('Photo de ' + p.name + ' ajoutée'); }
+    else {
+      s.failed = id; s._sync && s._sync();
+      if (loud) toast('Photo de ' + p.name + ' indisponible : touche Réessayer');
+    }
+  });
+}
+
 const num = v => { const x = parseFloat(String(v || '').replace(/[\s  ]/g, '').replace(',', '.')); return isFinite(x) ? x : 0; };
 function parseDate(v) {
   v = (v || '').trim(); let m;
@@ -325,10 +424,11 @@ function autoFill(force) {
       const nm = top[i] || '';
       if (s.name === nm) return s;
       const prev = old.find(o => !o.man && o.name && o.name === nm);
-      return prev || Object.assign(newSlot(), { name: nm });
+      return prev || Object.assign(newSlot(), { name: nm, handle: (pilotByName(nm) || {}).handle || '' });
     });
   }
   buildCards(); saveText(); render();
+  allSlots().forEach(s => ensurePhoto(s));   // registered drivers get their signup photo
 }
 function setStatus(live) {
   const st = document.getElementById('status');
@@ -498,14 +598,15 @@ function drawPodium(ctx) {
   drawHeader(ctx);
   ctx.textAlign = 'center';
   const n = parseInt(S.round, 10), d = n > 0 ? roundDate(n) : null;
-  ctx.fillStyle = '#fff'; fitFont(ctx, 'PODIUM', 960, 190, true); ctx.fillText('PODIUM', W / 2, 545);
-  ctx.fillStyle = RED; ctx.font = font(78, true); ctx.fillText(n > 0 ? 'ROUND ' + n : 'JUNIOR CUP', W / 2, 628);
+  ctx.fillStyle = '#fff'; fitFont(ctx, 'JUNIOR CUP', 960, 190, true); ctx.fillText('JUNIOR CUP', W / 2, 545);
+  const sub = n > 0 ? 'PODIUM - ROUND ' + n : 'PODIUM';
+  ctx.fillStyle = RED; fitFont(ctx, sub, 960, 78, true); ctx.fillText(sub, W / 2, 628);
   tagAndPill(ctx, 656, S.cat, d ? dmy(d) : '');
   glow(ctx, W / 2, 1150, 620, .38);
-  // podium: P2 left, P1 centre, P3 right; a step without a driver is left out
+  // podium: P2 left, P1 centre, P3 right; a step without a driver is left out, the others stay in place
   const shown = S.podium.map(hasDriver);
   if (!shown.some(Boolean)) shown[0] = true;
-  const dx = shown[1] && !shown[2] ? 159 : shown[2] && !shown[1] ? -159 : 0;   // two steps: centre the pair
+  const dx = 0;
   const FLOOR = 1650, T = 36;
   const P = [
     { i: 1, x: 58,  w: 318, top: 1330, r: 120, ring: 'silver', num: '2' },
@@ -620,17 +721,23 @@ function thumbDraw(cv, s) {
   c.clearRect(0, 0, cv.width, cv.height);
   c.save(); c.beginPath(); c.arc(r, r, r, 0, 7); c.clip(); drawPhoto(c, r, r, r, s); c.restore();
 }
-function matchDrivers(q) {   // names of the ranking, both categories, accent and case insensitive
+// suggestions: drivers of the ranking (both categories) and registered drivers, accent and case insensitive
+function matchDrivers(q) {
   const toks = fold(q).split(' ').filter(Boolean);
-  if (!S.data || !toks.length || fold(q).length < 2) return [];
-  const seen = new Set(), res = [];
-  for (const c of Object.keys(CATS))
+  if (!toks.length || fold(q).length < 2) return [];
+  const byKey = new Map(), hit = k => toks.every(t => k.includes(t));
+  if (S.data) for (const c of Object.keys(CATS))
     for (const p of S.data[c]) {
       const k = fold(p.name);
-      if (seen.has(k) || !toks.every(t => k.includes(t))) continue;
-      seen.add(k); res.push({ name: niceName(p.name), cat: LABEL[c] });
+      if (hit(k) && !byKey.has(k)) byKey.set(k, { name: niceName(p.name), cat: LABEL[c], handle: '', pilot: null });
     }
-  return res.slice(0, 5);
+  for (const p of PILOTS) {
+    if (!hit(p.key)) continue;
+    const e = byKey.get(p.key) || byKey.get(fold(p.name));
+    if (e) { e.handle = p.handle; e.pilot = p; }
+    else byKey.set(p.key, { name: p.name, cat: '', handle: p.handle, pilot: p });
+  }
+  return [...byKey.values()].slice(0, 5);
 }
 function buildCards() {
   const box = document.getElementById('podCards');
@@ -643,14 +750,19 @@ function buildCards() {
       '<h3>' + pos + ' · ' + LABEL[S.cat] + '<small></small></h3><div class="row"><div class="thumb"><canvas width="184" height="184"></canvas></div>' +
       '<div class="fields"><div class="ac"><input type="text" class="nm" placeholder="Prénom Nom (vide = marche masquée)" autocomplete="off" autocapitalize="words"><div class="sug hidden"></div></div>' +
       '<div class="at"><input type="text" class="ig" placeholder="compte Instagram (facultatif)" autocomplete="off" autocapitalize="none" spellcheck="false"></div>' +
-      '<div class="btns"><button class="sbtn pri ph">Photo</button><button class="sbtn cr">Recadrer</button><button class="sbtn np">Sans photo</button></div>' +
+      '<div class="btns"><button class="sbtn pri ph">Photo</button><button class="sbtn cr">Recadrer</button><button class="sbtn np">Sans photo</button>' +
+      '<button class="sbtn rt">Réessayer la photo</button></div>' +
       '</div></div>';
     const cv = card.querySelector('canvas'), nm = card.querySelector('.nm'), ig = card.querySelector('.ig');
-    const cr = card.querySelector('.cr'), np = card.querySelector('.np'), sm = card.querySelector('small');
+    const cr = card.querySelector('.cr'), np = card.querySelector('.np'), rt = card.querySelector('.rt');
+    const sm = card.querySelector('small'), th = card.querySelector('.thumb');
     nm.value = s.name; ig.value = s.handle;
     const sync = () => {
       thumbDraw(cv, s);
       cr.classList.toggle('hidden', !s.img); np.classList.toggle('hidden', !s.img);
+      rt.classList.toggle('hidden', !s.failed || !!s.img);
+      th.classList.toggle('load', !!s.want);
+      if (document.activeElement !== ig) ig.value = s.handle;   // @ filled from the signup list
       sm.textContent = !hasDriver(s) ? 'masquée sur l\'image' : s.man ? 'saisi à la main' : 'depuis le classement';
     };
     s._sync = sync; sync();
@@ -660,30 +772,40 @@ function buildCards() {
       const list = matchDrivers(nm.value);
       if (!list.length || (list.length === 1 && list[0].name === nm.value)) { hideSug(); return; }
       sug.innerHTML = '';
+      // few candidates left: start loading their photos before one is touched
+      if (list.length <= 3) list.forEach(p => { if (p.pilot && p.pilot.photo) pilotPhoto(p.pilot.photo); });
       list.forEach(p => {
         const b = document.createElement('button'); b.type = 'button';
         b.innerHTML = '<b></b><span></span>';
         b.querySelector('b').textContent = p.name;
-        b.querySelector('span').textContent = p.cat;
+        b.querySelector('span').textContent = [p.cat, p.handle ? '@' + p.handle : ''].filter(Boolean).join(' · ');
         // pointerdown fires before the input loses focus
         b.addEventListener('pointerdown', e => {
           e.preventDefault();
-          s.name = p.name; s.man = true; nm.value = s.name;
+          s.name = p.name; s.man = true; s.skip = '';
+          if (p.handle) s.handle = p.handle;
+          nm.value = s.name; ig.value = s.handle;
           hideSug(); sync(); saveText(); render();
+          ensurePhoto(s, true);
         });
         sug.appendChild(b);
       });
       sug.classList.remove('hidden');
     };
-    nm.addEventListener('input', () => { s.name = nm.value; s.man = true; sync(); saveText(); render(); showSug(); });
-    nm.addEventListener('focus', showSug);
+    nm.addEventListener('input', () => { s.name = nm.value; s.man = true; sync(); saveText(); render(); showSug(); ensurePhoto(s, true); });
+    nm.addEventListener('focus', () => { wake(); showSug(); });
     nm.addEventListener('blur', () => setTimeout(hideSug, 150));
     ig.addEventListener('input', () => { s.handle = cleanHandle(ig.value); saveText(); render(); });
     ig.addEventListener('blur', () => { ig.value = s.handle; });
     card.querySelector('.ph').onclick = () => pickPhoto(s);
     cv.onclick = () => (s.img ? openEditor(s) : pickPhoto(s));
     cr.onclick = () => openEditor(s);
-    np.onclick = () => { s.img = null; sync(); render(); };
+    np.onclick = () => {   // also stops this pilot's signup photo from coming back
+      const p = pilotByName(s.name);
+      s.img = null; s.auto = ''; s.want = ''; s.skip = p ? p.key : '';
+      sync(); saveText(); render();
+    };
+    rt.onclick = () => { s.failed = ''; ensurePhoto(s, true); };
     box.appendChild(card);
   });
 }
@@ -740,6 +862,7 @@ file.addEventListener('change', async () => {
   const url = URL.createObjectURL(f);
   try {
     const s = pickTarget, im = await loadImg(url);
+    s.auto = ''; s.want = ''; s.failed = '';   // own photo: wins over the signup photo
     setImg(s, im);
     openEditor(s);
   } catch (e) { toast('Impossible de lire cette photo'); }
@@ -873,6 +996,8 @@ document.getElementById('reload').onclick = () => {
 
 // ---------- boot ----------
 (async () => {
+  loadPilots();   // in the background: @ and photos appear as soon as the list is in
+  wake();
   const [logo, track, helmet] = await Promise.all([loadImg(SRC.logo), loadImg(SRC.track), loadImg(SRC.helmet)]);
   Object.assign(IMG, { logo, track, helmet });
   try { await Promise.all([document.fonts.load('700 100px EFB'), document.fonts.load('400 100px EFR')]); } catch (e) {}
@@ -880,6 +1005,7 @@ document.getElementById('reload').onclick = () => {
   rd.value = S.round;
   setCat(S.cat);
   setMode(S.mode);
+  allSlots().forEach(s => ensurePhoto(s));   // names restored from the draft get their photo back
   loadData();
 })();
 })();
